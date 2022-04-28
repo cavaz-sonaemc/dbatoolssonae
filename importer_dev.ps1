@@ -16,9 +16,11 @@ $servers = Connect-DbaInstance -SqlInstance $myInstances -SqlCredential $myAdmin
 
 $fname = $InstanceName.replace('`\','_'); 
 
-# allow dedicated admin connection temporarily to export objects
+########### DAQUI
+
+# allow dedicated admin connection temporarily to import objects
 Invoke-DbaQuery -SqlInstance $servers -Query " sp_configure 'remote admin connections', 1;
-# RECONFIGURE;"
+RECONFIGURE;"
 
 # 1. Import AG info
 $agobj = Get-Content -Raw -Path "$PSScriptRoot\AGinfo\$fname`_AGinfo.json" | ConvertFrom-Json
@@ -29,17 +31,9 @@ $agsnetmask = $agobj.AGSubnetMask
 $agsnetip = $agobj.AGSubnetIP
 
 # 2. JOBS
+echo "Importing jobs..."
 
 # 2.1 .DBA maintenance
-
-$listJobs = (Get-ChildItem "$PSScriptRoot\jobs\$fname" -Filter *.sql)
-
-foreach($jobPath in $listJobs.FullName){
-    # se for o Job que desliga outros Jobs não necessários na réplica, passa um argumento com o nome do AG, cas contrário, coloca só o job
-    Invoke-DbaQuery -SqlInstance $servers -Database 'msdb' -File $jobPath
-    }
-
-# 2.2 pre-existing jobs
 
 $listJobs = (Get-ChildItem "$PSScriptRoot\jobs_DBA" -Filter *.sql)
 
@@ -53,98 +47,60 @@ foreach($jobPath in $listJobs.FullName){
     }
 }
 
+# 2.2 pre-existing jobs
+
+$listJobs = (Get-ChildItem "$PSScriptRoot\jobs\$fname" -Filter *.sql)
+
+foreach($jobPath in $listJobs.FullName){
+    Invoke-DbaQuery -SqlInstance $servers -Database 'msdb' -File $jobPath
+    }
 
 # # linked server
+echo "Importing linked servers..."
 Invoke-DbaQuery -SqlInstance $servers -File "$PSScriptRoot\linkedServers\$fname.sql"
 
-# # agent proxies
-Invoke-DbaQuery -SqlInstance $servers -File "$PSScriptRoot\proxies\$fname.sql"
-
 # # credentials
+echo "Importing credentials..."
 Invoke-DbaQuery -SqlInstance $servers -File "$PSScriptRoot\credentials\$fname.sql"
 
+# # agent proxies
+echo "Importing proxies..."
+Invoke-DbaQuery -SqlInstance $servers -File "$PSScriptRoot\proxies\$fname.sql"
+
 # # email (TESTAR)
+echo "Importing emails..."
 Invoke-DbaQuery -SqlInstance $servers -File "$PSScriptRoot\email\$fname.sql"
 
 # Logins
+echo "Importing logins..."
 Invoke-DbaQuery -SqlInstance $servers -File "$PSScriptRoot\logins\$fname.sql"
 
 # disallow dac again
 Invoke-DbaQuery -SqlInstance $servers -Query " sp_configure 'remote admin connections', 0;
-# RECONFIGURE;"
+RECONFIGURE;"
 
 #IMPORT LOCATION DATAFILES
 # "$PSScriptRoot\dataFiles\$fname`_dfilesPath.json"
 
-$dfiles = Get-Content -Raw -Path "$PSScriptRoot\dataFiles\$fname'_dfiles.json" | ConvertFrom-Json
+########### AQUI
+
+$dfiles = Get-Content -Raw -Path "$PSScriptRoot\dataFiles\$fname`_dfiles.json" | ConvertFrom-Json
 
 foreach ($dfile in $dfiles) {
     $fileStructure = New-Object System.Collections.Specialized.StringCollection
-    $fileStructure.Add("E:\archive\example.mdf")
-    $filestructure.Add("E:\archive\example.ldf")
-    $filestructure.Add("E:\archive\example.ndf")
-    Mount-DbaDatabase -SqlInstance sql2016 -Database example -FileStructure $fileStructure
-}
-
-foreach ($db in $dblist) {
-    $AsResult = @();
-    $dfile = Get-DbaDbFile -SqlInstance $servers -Database $db
-    $pDataFile = ($dfile | Where-Object FileGroupName -eq "PRIMARY").PhysicalName
-    $logDataFile = ($dfile | Where-Object TypeDescription -eq "LOG").PhysicalName
-    $DataFile = ($dfile | Where-Object FileGroupName -eq "DATA").PhysicalName
-
-    $AsResult = New-Object PSObject -Property @{ 
-        dbName = $db;
-        primary = $pDataFile;
-        log = $logDataFile;
-        data = $DataFile
+    $fileStructure.Add($dfile.primary)
+    $filestructure.Add($dfile.log)
+    if (-not([string]::IsNullOrEmpty($dfile.data))) {
+        $filestructure.Add($dfile.data)
     }
-
-    $AsResults += $AsResult;
+    Mount-DbaDatabase -SqlInstance $servers -Database $dfile.dbName -FileStructure $fileStructure
 }
-
-$AsResults | Select-Object "dbName", "primary", "log", "data" | ConvertTo-Json | Out-File "$PSScriptRoot\dataFiles\$fname`_dfilesPath.json"
 
 #check if AO is configured and remove it from AG if so
 
-$agobj = Get-DbaAvailabilityGroup -SqlInstance $servers
-
-if ($null -eq $agobj){
-    $agstatus = "NoAg"
-}else {
-    # save AG info to disk
-    $agname = $agobj.AvailabilityGroupListeners.Name
-    $agip = $agobj.AvailabilityGroupListeners.AvailabilityGroupListenerIPAddresses.IPAddress
-    $agport = $agobj.AvailabilityGroupListeners.PortNumber
-    $agsnetmask = $agobj.AvailabilityGroupListeners.AvailabilityGroupListenerIPAddresses.SubnetMask
-    $agsnetip = $agobj.AvailabilityGroupListeners.AvailabilityGroupListenerIPAddresses.SubnetIP
-
-    $AsResult = New-Object PSObject -Property @{ 
-        AGName = $agname
-        AGIP = $agip
-        AGPort = $agport
-        AGSubnetMask = $agsnetmask
-        AGSubnetIP = $agsnetip
-    }
-    $AsResult | Select-Object "AGName", "AGIP", "AGPort", "AGSubnetMask", "AGSubnetIP" | ConvertTo-Json | Out-File "$PSScriptRoot\AGinfo\$fname`_AGinfo.json"
-
-    #GARANTIR QUE É PRIMARIA
-    if ($InstanceName -ne ($agobj.AvailabilityReplicas | Where-Object role -eq 'Primary').Name ) {
-        Write-Output "You're not on the primary replica. Switch to the $(($agobj.AvailabilityReplicas | Where-Object role -eq 'Primary').Name) and try again."
-        exit
-    }else {
-        Remove-DbaAgDatabase -SqlInstance $servers -AvailabilityGroup $agname -Confirm:$false
-    }
-
-}
-    
 
 # detach each database one by one
 
-foreach ($db in $dbList) {
-    Write-Output "Detaching $db..."
-    Dismount-DbaDatabase -SqlInstance $servers -Database $db
-}
 
 # $instanceName = "DCVW-PHWDBS-D1"
 # $fname = $InstanceName.replace('`\','_'); 
